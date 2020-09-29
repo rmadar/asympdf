@@ -37,8 +37,8 @@ class ndimSkewNormal():
         # Assign attributes
         self.loc   = loc
         self.alpha = alpha
-        self.scale = np.diag(scale)
-        self.cov   = self.scale @ cov @ self.scale
+        self.scale = scale
+        self.cov   = cov
         self.dim   = loc.shape[0]
 
     def pdf(self, x):
@@ -56,12 +56,15 @@ class ndimSkewNormal():
             x = x[np.newaxis]
         else:
             x = x.reshape(-1, self.dim)
-        
+
+        scale = np.diag(self.scale)
+        cov   = scale @ self.cov @ scale
+            
         # Compute the gaussian part
-        multinorm = stats.multivariate_normal.pdf(x-self.loc, cov=self.cov)        
+        multinorm = stats.multivariate_normal.pdf(x-self.loc, cov=cov)        
         
         # Compute the skewed part
-        alpha = np.matmul(self.alpha, np.linalg.inv(self.scale))[np.newaxis, :]   
+        alpha = np.matmul(self.alpha, np.linalg.inv(scale))[np.newaxis, :]   
         xNorm = (x-self.loc)[..., np.newaxis]
         beta  = np.squeeze(np.matmul(alpha, xNorm))
         cdf   = stats.norm.cdf(beta)
@@ -150,17 +153,73 @@ class ndimSkewNormal():
         def beMin(x):
             eNeg, ePos = x
             cl = self.interval1D(mode-eNeg, mode+ePos)
-            penalty = np.abs(self.pdf(mode-eNeg) - self.pdf(mode+ePos))**2
+            penalty = self.pdf(mode-eNeg) - self.pdf(mode+ePos)
             return np.abs(cl-CI) + np.abs(penalty)
 
         # Minimisation
         x0 = [std, std]
-        res = optimize.minimize(beMin, x0, tol=1e-3, method='Nelder-Mead')
+        res = optimize.minimize(beMin, x0, tol=1e-4, method='Nelder-Mead')
         eNeg, ePos = res.x
 
         # Return central, negative, positive values
         return mode, eNeg, ePos
         
+
+    def plot(self, borders=[], varNames=[], nPoints=50, kwargs_scatter={}, kwargs_coutour={}, **kwargs):
+
+        '''
+        Visualisation of the multi-dimensional PDF using input parameters to build
+         - 1D PDF on diagonal element
+         - 2D PDF on off-diagonal elements
+
+        borders  = list of pairs being (min, max) along each dimension.
+        varNames = list of string being variable names
+        nPoints  = number of points to be scanned along each dimension
+        '''
+        
+        # Plot scatter matrix
+        N = self.dim 
+        ranges = [np.linspace(borders[i][0], borders[i][1], nPoints) for i in range(N)]
+        
+        fig, axes = plt.subplots(nrows=N, ncols=N, figsize=(13, 13))
+        fig.subplots_adjust(hspace=0.2, wspace=0.2)
+        for ax in axes.flat:
+            ax.xaxis.set_visible(False)
+            ax.yaxis.set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.spines['top'].set_visible(False)
+
+        for i in range(N):
+            for j in range(N):  
+                    
+                if i == j:
+                    loc, scale, alpha = self.loc[i], self.scale[i], self.alpha[i]
+                    snDiag = ndimSkewNormal(loc=loc, scale=scale, alpha=alpha)
+                    axes[i, j].plot(ranges[i], snDiag.pdf(ranges[i]))
+                else:
+                    locIJ   = [  self.loc[j],   self.loc[i]]
+                    scaleIJ = [self.scale[j], self.scale[i]]
+                    alphaIJ = [self.alpha[j], self.alpha[i]]
+                    rho     = self.cov[j, i]
+                    covIJ  = [
+                        [   1, rho],
+                        [ rho,   1],
+                    ]
+                    sn = ndimSkewNormal(locIJ, scaleIJ, covIJ, alphaIJ)
+                    plotPdf2D(ranges[j], ranges[i], sn.pdf, ax=axes[i, j], **kwargs)
+                
+                # Axis labels
+                axes[i, j].set_xlabel(varNames[j])
+                axes[i, j].set_ylabel(varNames[i])
+                
+                # Make ticks and label appear only of left & bottom part
+                if i == 0:
+                    axes[j, i].yaxis.set_visible(True)
+                    
+                if j == 3:
+                    axes[j, i].xaxis.set_visible(True)
+
+
 
 def paramFromMeas(cVal, eNeg, ePos):
     '''
@@ -212,28 +271,43 @@ def nDimGrid(*Xs):
     return np.array(np.meshgrid(*Xs)).T.reshape(-1, len(Xs))
 
 
-def plotPdf2D(Xs, Ys, PDF2d, kwargs_scatter={}, kwargs_coutour={}):
+def plotPdf2D(Xs, Ys, PDF2d, kwargs_scatter={}, kwargs_coutour={}, **kwargs):
     
     '''
     Xs, Ys: 1D-array
     PDF: callable f(points) where points is a 2D array of 
          a shape (n, 2) returning 1d array of n values.
     '''
+
+    # Default keywords arguments
+    ax, contour, scatter = None, True, True
+    if 'ax' in  kwargs:
+        ax = kwargs['ax']
+    if 'contour' in kwargs:
+        contour = kwargs['contour']
+    if 'scatter' in kwargs:
+        scatter = kwargs['scatter']
     
     # Creates all (x, y) points from Xs and Ys
     points = nDimGrid(Xs, Ys)
 
     # Compute the proba for all these pairs
     proba = PDF2d(points)
-    
+
+    # Plot on existing axes of create a new plot
+    obj = plt
+    if ax: obj = ax
+        
     # Plot it using a scatter
-    x, y = points[:, 0], points[:, 1]
-    plt.scatter(x, y, c=proba, **kwargs_scatter);
+    if scatter:
+        x, y = points[:, 0], points[:, 1]
+        obj.scatter(x, y, c=proba, **kwargs_scatter);
 
     # Produce a contour plot, coming back to meshgrid
-    XX, YY = np.meshgrid(Xs, Ys)
-    PP = proba.reshape(len(Xs), len(Ys)).T
-    plt.contour(XX, YY, PP, **kwargs_coutour);
+    if contour:
+        XX, YY = np.meshgrid(Xs, Ys)
+        PP = proba.reshape(len(Xs), len(Ys)).T
+        obj.contour(XX, YY, PP, **kwargs_coutour);
 
 
 def plotDataProj2D(data, kwargs_scatter={}):
@@ -284,23 +358,23 @@ def plotPdfProj2D(points, PDF, kwargs_scatter={}):
     plotDataProj2D(pointS, kwargs_scatter)
 
 
-def generateData(pdf, n=10000, xLim=[[-5, 5]]):
+def generateData(pdf, n=10000, borders=[[-5, 5]]):
     
     '''
     Return a dataset distributed according the given pdf. This is an array of
     shape (Naccepted, Ndim) where Naccepted is a priori unknown.
     
-    pdf : callable pdf(x) where x can be a 2D array of shape (Npoints, Ndim)
-    n   : number of generated toys
-    xLim: 2D array of shape (Ndim, 2) containing limits which defined variable space scan.
+    pdf    : callable pdf(x) where x can be a 2D array of shape (Npoints, Ndim)
+    n      : number of generated toys
+    borders: 2D array of shape (Ndim, 2) containing limits which defined variable space scan.
     '''
     
     # Limits and dimension of initial space
-    xLim = np.array(xLim)
-    nDim = xLim.shape[0]
+    borders = np.array(borders)
+    nDim    = borders.shape[0]
     
     # Border values for PDF
-    Xs = np.array([np.random.rand(n)*(xLim[i][1]-xLim[i][0]) + xLim[i][0] for i in range(nDim)]).T
+    Xs = np.array([np.random.rand(n)*(borders[i][1]-borders[i][0]) + borders[i][0] for i in range(nDim)]).T
     Ys = np.random.rand(n) * np.max(pdf(Xs))
     
     # Return x values of kept points

@@ -33,7 +33,11 @@ class ndimSkewNormal():
             scale = scale[np.newaxis]
             cov   = cov[np.newaxis, np.newaxis]
             alpha = alpha[np.newaxis]
-        
+
+        # Regularization of covariance matrix if at least a matrix
+        if loc.ndim > 0:
+            cov = cov + np.eye(loc.shape[0])*1e-12
+                    
         # Assign attributes
         self.loc   = loc
         self.alpha = alpha
@@ -41,6 +45,7 @@ class ndimSkewNormal():
         self.cov   = cov
         self.dim   = loc.shape[0]
 
+        
     def pdf(self, x):
         
         '''
@@ -136,6 +141,20 @@ class ndimSkewNormal():
         if self._check1D():
             return self.cdf1D(x1) - self.cdf1D(x0)
         
+    def borders(self, nSigma=3):
+        '''
+        Return an array of shape (ndim, 2) with xmin, xmax along
+        each dimension corresponding to mode-nSigma*errMin,  
+        mode+nSigma*errPos.
+        '''
+        borders = []
+        for i in range(self.dim):
+            loc, scale, alpha = self.loc[i], self.scale[i], self.alpha[i]
+            sn_tmp = ndimSkewNormal(loc=loc, scale=scale, alpha=alpha)
+            v, m, p = sn_tmp.measAsymError()
+            borders.append([v-nSigma*m, v+nSigma*p])
+        return np.array(borders)
+
     def measAsymError(self, CI=0.68):
         '''
         return central value, negative error, positive error
@@ -160,7 +179,7 @@ class ndimSkewNormal():
         x0 = [std, std]
         res = optimize.minimize(beMin, x0, tol=1e-4, method='Nelder-Mead')
         eNeg, ePos = res.x
-
+        
         # Return central, negative, positive values
         return mode, eNeg, ePos
         
@@ -178,7 +197,11 @@ class ndimSkewNormal():
         '''
         
         # Plot scatter matrix
-        N = self.dim 
+        N = self.dim
+        
+        # Range for plotting
+        if len(borders) == 0:
+            borders = self.borders()
         ranges = [np.linspace(borders[i][0], borders[i][1], nPoints) for i in range(N)]
         
         fig, axes = plt.subplots(nrows=N, ncols=N, figsize=(13, 13))
@@ -206,21 +229,113 @@ class ndimSkewNormal():
                         [ rho,   1],
                     ]
                     sn = ndimSkewNormal(locIJ, scaleIJ, covIJ, alphaIJ)
-                    plotPdf2D(ranges[j], ranges[i], sn.pdf, ax=axes[i, j], **kwargs)
+                    plotPdf2D(ranges[j], ranges[i], sn.pdf, ax=axes[i, j],
+                              kwargs_scatter=kwargs_scatter,
+                              kwargs_coutour=kwargs_coutour,
+                              **kwargs)
                 
                 # Axis labels
-                axes[i, j].set_xlabel(varNames[j])
-                axes[i, j].set_ylabel(varNames[i])
+                if varNames:
+                    axes[i, j].set_xlabel(varNames[j])
+                    axes[i, j].set_ylabel(varNames[i])
                 
                 # Make ticks and label appear only of left & bottom part
                 if i == 0:
                     axes[j, i].yaxis.set_visible(True)
                     
-                if j == 3:
+                if j == self.dim-1:
                     axes[j, i].xaxis.set_visible(True)
 
 
+    def generateDataFromGauss(self, N=10000, chunck=10000, sigmaScale=3):
 
+        '''
+        [DEPRECIATED]
+        
+        Sampling based on gaussians PDFs.
+        N          : number of wanted toys
+        chunck     : number of one run
+        sigmaScale : scale factor for the sigma of the underlying gaussian 
+                        -> sigma = max(eNeg, ePos) * sigmaScale
+        '''
+
+        # Useful parameters
+        Ndim  = self.dim
+        covG = np.zeros_like(self.cov)
+        muG  = np.zeros_like(self.loc)
+        siG  = np.zeros_like(self.loc)
+
+        # Get (mean, eNeg, ePos) in each dimension
+        for i in range(Ndim):
+            sn = ndimSkewNormal(loc=self.loc[i], scale=self.scale[i], alpha=self.alpha[i])
+            val, eNeg, ePos = sn.measAsymError()
+            muG[i] = val
+            siG[i] = max(eNeg, ePos) * sigmaScale
+
+        # Compute the covariance matrix
+        for i in range(Ndim):
+            for j in range(Ndim):
+                covG[i, j] = self.cov[i, j] * siG[i] * siG[j]
+
+        nToys, data = 0, []
+        while nToys<N:
+            Xs = np.random.multivariate_normal(mean=muG, cov=covG, size=chunck)
+            Ys = np.random.rand(chunck) * np.max(self.pdf(Xs))
+            data.append(Xs[self.pdf(Xs)>=Ys])
+            nToys += data[-1].shape[0]
+
+        return np.concatenate(data)
+                    
+
+    def generateDataLog(self, n=200000, borders=[]):
+    
+        '''
+        Return data following log(PDF) and weights 
+        to get back to a distrubtion following the 
+        original PDF. 
+
+        Advantages wrt apdf.generateData(pdf)
+          - better tail population
+          - better sampling efficiency
+
+        Drawbacks wrt apdf.generateData(pdf)
+          - weighted sample 
+
+        return data, weights
+          - data   : 2D array of shape (Naccepted, Ndim)
+          - weights: 1D array of shape (Naccepted)
+        '''
+
+        # Range for data generations
+        if len(borders) == 0:
+            borders = self.borders(10)
+
+        # PDF
+        pdf = self.pdf
+            
+        # Manage borders and dimension
+        borders = np.array(borders)
+        nDim    = borders.shape[0]
+        
+        # Initial space {x1, ... , xn} sampling
+        Xs = np.array([np.random.rand(n)*(borders[i][1]-borders[i][0]) + borders[i][0] for i in range(nDim)]).T 
+        
+        # Final space y sampling
+        logY = np.log(pdf(Xs) + 1e-120)
+        yMin, yMax =  np.min(logY), np.max(logY)    
+        Ys = np.random.rand(n) * (yMax-yMin) + yMin
+        
+        # Select accepted points
+        data = Xs[logY>=Ys]
+        
+        # Compute weights
+        weights = pdf(data)
+        
+        # Return data and weights
+        return data, weights
+
+
+    
 def paramFromMeas(cVal, eNeg, ePos):
     '''
     Return the 3 parameters (loc, scale, alpha) of a 1D skew normal 
@@ -237,7 +352,7 @@ def paramFromMeas(cVal, eNeg, ePos):
     scaleP = p / dfClosest['pos'].values[0]
     scaleN = m / dfClosest['neg'].values[0]
     scale = (scaleP+scaleN) / 2.0
-    loc = c-mode*scale
+    loc = c - mode*scale
     
     if np.abs(alpha)>=18:
         print('Warning: shape parameter reached maximum tabulated value.')
@@ -310,28 +425,49 @@ def plotPdf2D(Xs, Ys, PDF2d, kwargs_scatter={}, kwargs_coutour={}, **kwargs):
         obj.contour(XX, YY, PP, **kwargs_coutour);
 
 
-def plotDataProj2D(data, kwargs_scatter={}):
+def plotScatterMatrix(data, varNames=[], nPoints=1000, kwargs_hist={}, kwargs_scatter={}):
+
     '''
     Plot projection over all variables pairs (Xi, Xj) of a
     dataset with N points of n-dimension.
     
     data: array with a shape (N, n)
     '''
+    
+    N = data.shape[1]
+    fig, axes = plt.subplots(nrows=N, ncols=N, figsize=(13, 13))
+    fig.subplots_adjust(hspace=0.2, wspace=0.2)
+    for ax in axes.flat:
+        ax.xaxis.set_visible(False)
+        ax.yaxis.set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['top'].set_visible(False)
 
-    # Create all variable pairs (with indices)
-    pairIdx = list(combinations(range(data.shape[1]), 2))
-
-    # Plot scatter matrix
-    N = len(pairIdx)/2
-    plt.figure(figsize=(5*N, 5*N))
-
-    # Plot projection for each pair of variables
-    for i, j in pairIdx:
-        iPlot = i*N + j
-        plt.subplot(N, N, iPlot)
-        plt.scatter(data[:, j], data[:, i], **kwargs_scatter)
-        plt.xlabel('var{}'.format(j))
-        plt.ylabel('var{}'.format(i))
+        
+    step = int( data.shape[0] / nPoints )
+    if step == 0 or nPoints <= 0:
+        step = 1
+    d = data[::step]
+        
+    for i in range(N):
+        for j in range(N):
+            
+            if i == j:
+                axes[i, i].hist(d[:, i], **kwargs_hist)
+            else:
+                axes[i, j].scatter(d[:, j], d[:, i], **kwargs_scatter)
+                
+            # Axis labels
+            if varNames:
+                axes[i, j].set_xlabel(varNames[j])
+                axes[i, j].set_ylabel(varNames[i])
+                
+            # Make ticks and label appear only of left & bottom part
+            if i == 0:
+                axes[j, i].yaxis.set_visible(True)
+                    
+            if j == N-1:
+                axes[j, i].xaxis.set_visible(True)
 
         
 def plotPdfProj2D(points, PDF, kwargs_scatter={}):
@@ -379,3 +515,72 @@ def generateData(pdf, n=10000, borders=[[-5, 5]]):
     
     # Return x values of kept points
     return Xs[pdf(Xs)>=Ys]
+
+
+def generateDataLog(pdf, n=10000, borders=[[-5, 5]]):
+    
+    '''
+    Return data following log(PDF) and weights 
+    to get back to a distrubtion following PDF.
+    '''
+    
+    # Manage borders and dimension
+    borders = np.array(borders)
+    nDim    = borders.shape[0]
+    
+    # Initial space {x1, ... , xn} sampling
+    Xs = np.array([np.random.rand(n)*(borders[i][1]-borders[i][0]) + borders[i][0] for i in range(nDim)]).T 
+    
+    # Final space y sampling
+    logY = np.log(pdf(Xs) + 1e-120)
+    yMin, yMax =  np.min(logY), np.max(logY)    
+    Ys = np.random.rand(n) * (yMax-yMin) + yMin
+
+    # Select accepted points
+    data = Xs[logY>=Ys]
+
+    # Compute weights
+    weights = pdf(data)
+    
+    # Return data and weights
+    return data, weights
+
+
+def fitWeightedDistribution(data, weights, nbins=100):
+
+    '''
+    This functions performs a fit of weighted binned data by
+    a one dimension skew normal function.
+
+    data    = 1D array of shape N
+    weights = 1D array of shape N
+    nbins   = number of bins
+
+    Return skew-normal parmaters: (loc, scale, alpha)
+    '''
+    
+    # Weighted histogram
+    Nbins    = nbins
+    bins     = np.linspace(data.min(), data.max(), Nbins)
+    ydata, _ = np.histogram(data, weights=weights, bins=bins, density=True)
+
+    # Bin center as x data
+    xdata = np.array([0.5 * (bins[i] + bins[i+1]) for i in range(len(bins)-1)])
+
+    # Loss function
+    def loss(x):
+        l, s, a = x
+        f = apdf.ndimSkewNormal(loc=l, scale=s, alpha=a).pdf
+        w = np.sqrt(np.abs(xdata - xdata.mean()))
+        w = w/w.max()
+        dy2 = (ydata - f(xdata))**2
+        return np.sum(dy2*w)
+
+    l0 = np.average(data, weights=weights) 
+    s0 = np.sqrt( np.average((data-l0)**2, weights=weights) )
+    a0 = 1.
+
+    res = optimize.minimize(loss, tol=1e-6, x0=[l0, s0, a0], method='Nelder-Mead')
+    loc, scale, alpha = res.x
+    
+    return loc, scale, alpha
